@@ -1,37 +1,37 @@
-import telebot
-from binance.client import Client
+import os
 import time
-import websocket, threading, json, os
+import json
+import threading
+import websocket
 from dotenv import load_dotenv
+from binance.client import Client
+import telebot
 
 load_dotenv('.env')
-API_KEY = os.environ["API_KEY"]
-API_SECRET = os.environ["API_SECRET"]
-BOT_API_KEY = os.environ["BOT_API_KEY"]
-CHAT_ID = os.environ["CHAT_ID"]
+
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+BOT_API_KEY = os.getenv("BOT_API_KEY")
+PAIR = os.getenv("PAIR")
+CHAT_ID = os.getenv("CHAT_ID")
 
 client = Client(API_KEY, API_SECRET)
 bot = telebot.TeleBot(token=BOT_API_KEY)
 
-# Dictionary to store the most recent status for each orderId
-order_statuses = {}
 
+order_statuses = {}
+last_price = {}
 def process_execution_report(message):
     global order_statuses
     symbol = message["s"]
     order_id = message["i"]
     current_status = message["X"]
-
-    # Extract quantity (q) and price (p) from the event
-    # These are strings in the message; convert them to float to calculate notional value.
     quantity_str = message.get("q", "0")
     price_str = message.get("p", "0")
     quantity = float(quantity_str)
     price = float(price_str)
-    # Compute "order value" (notional) if it's a limit order (price != 0)
     order_value = quantity * price
 
-    # If this is the first time we see this order
     if order_id not in order_statuses:
         order_statuses[order_id] = current_status
         bot.send_message(
@@ -58,20 +58,20 @@ def process_execution_report(message):
                 f"Value: {order_value}"
             )
 
-def on_message(ws, message):
+def on_message_user_data(ws, message):
     data = json.loads(message)
-    # Check if this event is an executionReport (order update)
+    # Якщо в події міститься "executionReport", це оновлення ордера
     if "e" in data and data["e"] == "executionReport":
         process_execution_report(data)
 
-def on_error(ws, error):
-    print(f"WebSocket помилка: {error}")
+def on_error_user_data(ws, error):
+    print(f"[UserDataStream] Помилка WebSocket: {error}")
 
-def on_close(ws):
-    print("WebSocket з'єднання закрито.")
+def on_close_user_data(ws):
+    print("[UserDataStream] З'єднання закрито.")
 
-def on_open(ws):
-    print("WebSocket з'єднання відкрите. Слухаємо оновлення ордерів...")
+def on_open_user_data(ws):
+    print("[UserDataStream] З'єднання відкрите. Слухаємо ордери...")
 
 def keepalive_listen_key(listen_key, interval=30 * 60):
     while True:
@@ -81,25 +81,71 @@ def keepalive_listen_key(listen_key, interval=30 * 60):
             print(f"Помилка при подовженні listen key: {e}")
         time.sleep(interval)
 
-def main():
-    # 1) Get the listen key for the user data stream
+def monitor_user_data_stream():
     listen_key = client.stream_get_listen_key()
-
-    # 2) Start a thread to keep the listen key alive
     t = threading.Thread(target=keepalive_listen_key, args=(listen_key,), daemon=True)
     t.start()
 
-    # 3) Connect to the user data stream websocket
-    ws = websocket.WebSocketApp(
+    ws_user = websocket.WebSocketApp(
         f"wss://stream.binance.com:9443/ws/{listen_key}",
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
+        on_open=on_open_user_data,
+        on_message=on_message_user_data,
+        on_error=on_error_user_data,
+        on_close=on_close_user_data
     )
+    ws_user.run_forever()
 
-    # 4) Start listening (this call blocks the main thread)
-    ws.run_forever()
+def on_message_ticker(ws, message):
+    global last_price
+
+    data = json.loads(message)
+    symbol = data.get("s")
+    current_price_str = data.get("c", "0")
+    current_price = float(current_price_str)
+    if symbol not in last_price:
+        last_price[symbol] = current_price
+        return
+
+    previous_price = last_price[symbol]
+    price_change_pct = abs((current_price - previous_price) / previous_price)
+    print(price_change_pct, previous_price)
+    if price_change_pct >= 0.02:
+        bot.send_message(
+            CHAT_ID,
+            f"⚠️ Ціна {symbol} змінилася на {price_change_pct*100:.2f}%\n"
+            f"Стара ціна: {previous_price}\n"
+            f"Нова ціна: {current_price}"
+        )
+        last_price[symbol] = current_price
+
+def on_error_ticker(ws, error):
+    print(f"[TickerStream] Помилка WebSocket: {error}")
+
+def on_close_ticker(ws):
+    print("[TickerStream] З'єднання тикера закрито.")
+
+def on_open_ticker(ws):
+    print("[TickerStream] З'єднання тикера відкрите. Слухаємо зміну ціни...")
+
+def monitor_symbol_price(symbol="BTCUSDT"):
+    stream_url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@ticker"
+    ws_ticker = websocket.WebSocketApp(
+        stream_url,
+        on_open=on_open_ticker,
+        on_message=on_message_ticker,
+        on_error=on_error_ticker,
+        on_close=on_close_ticker
+    )
+    ws_ticker.run_forever()
+
+def main():
+    t_orders = threading.Thread(target=monitor_user_data_stream, daemon=True)
+    t_orders.start()
+    t_price = threading.Thread(target=monitor_symbol_price, args=(PAIR,), daemon=True)
+    t_price.start()
+
+    while True:
+        time.sleep(1)
 
 if __name__ == "__main__":
     main()
